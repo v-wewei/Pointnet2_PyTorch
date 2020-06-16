@@ -1,45 +1,34 @@
-from __future__ import (
-    division,
-    absolute_import,
-    with_statement,
-    print_function,
-    unicode_literals,
-)
 import torch
-from torch.autograd import Function
 import torch.nn as nn
-import etw_pytorch_utils as pt_utils
-import sys
+import warnings
+from torch.autograd import Function
+from typing import *
 
 try:
-    import builtins
-except:
-    import __builtin__ as builtins
-
-try:
-    import pointnet2._ext as _ext
+    import pointnet2_ops._ext as _ext
 except ImportError:
-    if not getattr(builtins, "__POINTNET2_SETUP__", False):
-        raise ImportError(
-            "Could not import _ext module.\n"
-            "Please see the setup instructions in the README: "
-            "https://github.com/erikwijmans/Pointnet2_PyTorch/blob/master/README.rst"
-        )
+    from torch.utils.cpp_extension import load
+    import glob
+    import os.path as osp
+    import os
 
-if False:
-    # Workaround for type hints without depending on the `typing` module
-    from typing import *
+    warnings.warn("Unable to load pointnet2_ops cpp extension. JIT Compiling.")
 
+    _ext_src_root = osp.join(osp.dirname(__file__), "_ext-src")
+    _ext_sources = glob.glob(osp.join(_ext_src_root, "src", "*.cpp")) + glob.glob(
+        osp.join(_ext_src_root, "src", "*.cu")
+    )
+    _ext_headers = glob.glob(osp.join(_ext_src_root, "include", "*"))
 
-class RandomDropout(nn.Module):
-    def __init__(self, p=0.5, inplace=False):
-        super(RandomDropout, self).__init__()
-        self.p = p
-        self.inplace = inplace
-
-    def forward(self, X):
-        theta = torch.Tensor(1).uniform_(0, self.p)[0]
-        return pt_utils.feature_dropout_no_scaling(X, theta, self.train, self.inplace)
+    os.environ["TORCH_CUDA_ARCH_LIST"] = "3.7+PTX;5.0;6.0;6.1;6.2;7.0;7.5"
+    _ext = load(
+        "_ext",
+        sources=_ext_sources,
+        extra_include_paths=[osp.join(_ext_src_root, "include")],
+        extra_cflags=["-O3"],
+        extra_cuda_cflags=["-O3", "-Xfatbin", "-compress-all"],
+        with_cuda=True,
+    )
 
 
 class FurthestPointSampling(Function):
@@ -62,11 +51,15 @@ class FurthestPointSampling(Function):
         torch.Tensor
             (B, npoint) tensor containing the set
         """
-        return _ext.furthest_point_sampling(xyz, npoint)
+        out = _ext.furthest_point_sampling(xyz, npoint)
+
+        ctx.mark_non_differentiable(out)
+
+        return out
 
     @staticmethod
-    def backward(xyz, a=None):
-        return None, None
+    def backward(ctx, grad_out):
+        return ()
 
 
 furthest_point_sample = FurthestPointSampling.apply
@@ -92,15 +85,14 @@ class GatherOperation(Function):
             (B, C, npoint) tensor
         """
 
-        _, C, N = features.size()
-
-        ctx.for_backwards = (idx, C, N)
+        ctx.save_for_backward(idx, features)
 
         return _ext.gather_points(features, idx)
 
     @staticmethod
     def backward(ctx, grad_out):
-        idx, C, N = ctx.for_backwards
+        idx, features = ctx.saved_tensors
+        N = features.size(2)
 
         grad_features = _ext.gather_points_grad(grad_out.contiguous(), idx, N)
         return grad_features, None
@@ -130,12 +122,15 @@ class ThreeNN(Function):
             (B, n, 3) index of 3 nearest neighbors
         """
         dist2, idx = _ext.three_nn(unknown, known)
+        dist = torch.sqrt(dist2)
 
-        return torch.sqrt(dist2), idx
+        ctx.mark_non_differentiable(dist, idx)
+
+        return dist, idx
 
     @staticmethod
-    def backward(ctx, a=None, b=None):
-        return None, None
+    def backward(ctx, grad_dist, grad_idx):
+        return ()
 
 
 three_nn = ThreeNN.apply
@@ -161,10 +156,7 @@ class ThreeInterpolate(Function):
         torch.Tensor
             (B, c, n) tensor of the interpolated features
         """
-        B, c, m = features.size()
-        n = idx.size(1)
-
-        ctx.three_interpolate_for_backward = (idx, weight, m)
+        ctx.save_for_backward(idx, weight, features)
 
         return _ext.three_interpolate(features, idx, weight)
 
@@ -186,13 +178,14 @@ class ThreeInterpolate(Function):
 
         None
         """
-        idx, weight, m = ctx.three_interpolate_for_backward
+        idx, weight, features = ctx.saved_tensors
+        m = features.size(2)
 
         grad_features = _ext.three_interpolate_grad(
             grad_out.contiguous(), idx, weight, m
         )
 
-        return grad_features, None, None
+        return grad_features, torch.zeros_like(idx), torch.zeros_like(weight)
 
 
 three_interpolate = ThreeInterpolate.apply
@@ -216,10 +209,7 @@ class GroupingOperation(Function):
         torch.Tensor
             (B, C, npoint, nsample) tensor
         """
-        B, nfeatures, nsample = idx.size()
-        _, C, N = features.size()
-
-        ctx.for_backwards = (idx, N)
+        ctx.save_for_backward(idx, features)
 
         return _ext.group_points(features, idx)
 
@@ -239,11 +229,12 @@ class GroupingOperation(Function):
             (B, C, N) gradient of the features
         None
         """
-        idx, N = ctx.for_backwards
+        idx, features = ctx.saved_tensors
+        N = features.size(2)
 
         grad_features = _ext.group_points_grad(grad_out.contiguous(), idx, N)
 
-        return grad_features, None
+        return grad_features, torch.zeros_like(idx)
 
 
 grouping_operation = GroupingOperation.apply
@@ -271,11 +262,15 @@ class BallQuery(Function):
         torch.Tensor
             (B, npoint, nsample) tensor with the indicies of the features that form the query balls
         """
-        return _ext.ball_query(new_xyz, xyz, radius, nsample)
+        output = _ext.ball_query(new_xyz, xyz, radius, nsample)
+
+        ctx.mark_non_differentiable(output)
+
+        return output
 
     @staticmethod
-    def backward(ctx, a=None):
-        return None, None, None, None
+    def backward(ctx, grad_out):
+        return ()
 
 
 ball_query = BallQuery.apply
